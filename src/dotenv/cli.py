@@ -18,7 +18,13 @@ except ImportError:
     )
     sys.exit(1)
 
-from .main import DotEnv, dotenv_values, set_key, unset_key
+from .main import (
+    CircularInterpolationError,
+    DotEnv,
+    dotenv_values,
+    set_key,
+    unset_key,
+)
 from .version import __version__
 
 
@@ -83,6 +89,30 @@ def stream_file(path: os.PathLike) -> Iterator[IO[str]]:
         sys.exit(2)
 
 
+def read_dotenv(file: str, override: bool) -> Dict[str, Optional[str]]:
+    """Return the .env file as a dict, exiting with code 2 on a cycle."""
+    try:
+        return DotEnv(file, override=override, encoding="utf-8").dict()
+    except CircularInterpolationError as exc:
+        print(f"Error in env file: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
+def read_values(**kwargs: Any) -> Dict[str, Optional[str]]:
+    """
+    Read the .env file with `dotenv_values`, exiting with code 2 on a cycle.
+
+    A circular reference has no value that could be derived from the file, so
+    the command reports it on stderr and stops instead of handing downstream
+    processes empty strings.
+    """
+    try:
+        return dotenv_values(**kwargs)
+    except CircularInterpolationError as exc:
+        print(f"Error in env file: {exc}", file=sys.stderr)
+        sys.exit(2)
+
+
 @cli.command(name="list")
 @click.pass_context
 @click.option(
@@ -98,7 +128,7 @@ def list_values(ctx: click.Context, output_format: str) -> None:
     file = ctx.obj["FILE"]
 
     with stream_file(file) as stream:
-        values = dotenv_values(stream=stream)
+        values = read_values(stream=stream)
 
     if output_format == "json":
         click.echo(json.dumps(values, indent=2, sort_keys=True))
@@ -146,7 +176,7 @@ def get(ctx: click.Context, key: Any) -> None:
     file = ctx.obj["FILE"]
 
     with stream_file(file) as stream:
-        values = dotenv_values(stream=stream)
+        values = read_values(stream=stream)
 
     # Empty strings are valid values; only missing keys / bare keys (None) fail.
     if key not in values or values[key] is None:
@@ -200,7 +230,7 @@ def run(ctx: click.Context, override: bool, commandline: tuple[str, ...]) -> Non
         )
     dotenv_as_dict = {
         k: v
-        for (k, v) in DotEnv(file, override=override, encoding="utf-8").dict().items()
+        for (k, v) in read_dotenv(file, override).items()
         if v is not None and (override or k not in os.environ)
     }
 

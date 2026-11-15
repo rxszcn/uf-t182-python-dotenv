@@ -76,3 +76,20 @@ def test_ipython_path_expands_user(tmp_path, monkeypatch):
     ipshell.run_line_magic("dotenv", "~/.env")
 
     assert os.environ["dotenv_ipython_home"] == "b"
+
+
+@mock.patch.dict(os.environ, {}, clear=True)
+def test_ipython_circular_reference_prints_error(tmp_path, capsys):
+    from IPython.terminal.embed import InteractiveShellEmbed
+
+    (tmp_path / ".env").write_text("a=${b}\nb=${a}\n")
+    os.chdir(tmp_path)
+
+    ipshell = InteractiveShellEmbed()
+    ipshell.run_line_magic("load_ext", "dotenv")
+    ipshell.run_line_magic("dotenv", "")
+
+    assert (
+        "circular variable reference detected: a -> b -> a" in capsys.readouterr().out
+    )
+    assert os.environ == {}

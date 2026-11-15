@@ -232,6 +232,19 @@ values defined in the following list:
 - Default value, if provided.
 - Empty string.
 
+A variable that refers to itself, such as `KEY=${KEY}`, is resolved with the
+same rules: the reference sees the environment, an earlier definition of the
+same key, the default, or the empty string, but never the value being defined.
+
+Two or more variables that refer to each other in a cycle (for example
+`A=${B}` and `B=${A}`) cannot be resolved by any of those rules, so they are
+reported as an error instead of silently becoming empty strings. Python code
+raises `dotenv.CircularInterpolationError`, which lists the cycles it found;
+the `dotenv` command prints the cycles and exits with code 2. References are
+resolved in file order, so a variable that refers to a key defined later in
+the file (without a reference back) still falls back to the environment, the
+default, or the empty string as before; that is not a cycle.
+
 ## Related Projects
 
 - [environs](https://github.com/sloria/environs)

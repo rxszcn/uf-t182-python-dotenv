@@ -5,18 +5,61 @@ import pathlib
 import stat
 import sys
 import tempfile
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from contextlib import contextmanager
-from typing import IO, Dict, Iterable, Iterator, Mapping, Optional, Tuple, Union
+from typing import (
+    IO,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Set,
+    Tuple,
+    Union,
+)
 
 from .parser import Binding, parse_stream
-from .variables import parse_variables
+from .variables import Variable, parse_variables
 
 # A type alias for a string path to be used for the paths in this file.
 # These paths may flow to `open()` and `os.replace()`.
 StrPath = Union[str, "os.PathLike[str]"]
 
 logger = logging.getLogger(__name__)
+
+
+class CircularInterpolationError(ValueError):
+    """Raised when keys in a .env file reference each other in a cycle.
+
+    A self-reference such as ``A=${A}`` is not a cycle: when ``A`` is being
+    resolved it is not yet part of the values collected from the file, so the
+    reference falls back to the environment, the default, or an empty string.
+    Two or more keys that reference each other have no such fallback: the
+    value of each depends on the value of the other, so there is nothing to
+    fall back on and the keys would otherwise silently become empty strings.
+
+    ``cycles`` holds every detected cycle as a tuple of key names whose first
+    and last element are the same key, in file order.
+    """
+
+    # Cycles longer than this are abbreviated in the message, which keeps a
+    # generated .env with a huge tangled group readable. `cycles` is complete.
+    _MAX_KEYS_IN_MESSAGE = 12
+
+    def __init__(self, cycles: Sequence[Sequence[str]]) -> None:
+        self.cycles: List[Tuple[str, ...]] = [tuple(cycle) for cycle in cycles]
+        description = "; ".join(self._format_cycle(cycle) for cycle in self.cycles)
+        super().__init__(f"circular variable reference detected: {description}")
+
+    @classmethod
+    def _format_cycle(cls, cycle: Sequence[str]) -> str:
+        if len(cycle) <= cls._MAX_KEYS_IN_MESSAGE:
+            return " -> ".join(cycle)
+        head = " -> ".join(cycle[: cls._MAX_KEYS_IN_MESSAGE - 2])
+        return f"{head} -> ... ({len(cycle) - 1} keys) ... -> {cycle[-1]}"
 
 
 def _load_dotenv_disabled() -> bool:
@@ -330,10 +373,176 @@ def unset_key(
     return removed, key_to_unset
 
 
+def _referenced_names(value: Optional[str]) -> Iterator[str]:
+    """Yield the names of the variables a raw value references."""
+    if value is None:
+        return
+    for atom in parse_variables(value):
+        if isinstance(atom, Variable):
+            yield atom.name
+
+
+def _strongly_connected_components(
+    graph: Mapping[str, Sequence[str]],
+) -> List[List[str]]:
+    """
+    Return the strongly connected components of `graph` (Tarjan, iterative).
+
+    Components are returned in a deterministic order: each one is ordered by
+    the position of its nodes in `graph`, and components are ordered by the
+    position of their first node. Iterative rather than recursive so that a
+    long reference chain in a generated .env can't hit the recursion limit.
+    """
+    order = {name: index for index, name in enumerate(graph)}
+    index_of: Dict[str, int] = {}
+    lowlink: Dict[str, int] = {}
+    on_stack: Set[str] = set()
+    stack: List[str] = []
+    components: List[List[str]] = []
+    counter = 0
+
+    for root in graph:
+        if root in index_of:
+            continue
+        # Each frame is a node plus an iterator over its not-yet-visited
+        # successors.
+        work: List[Tuple[str, Iterator[str]]] = [(root, iter(graph[root]))]
+        index_of[root] = lowlink[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+
+        while work:
+            node, successors = work[-1]
+            advanced = False
+            for successor in successors:
+                if successor not in graph:
+                    continue
+                if successor not in index_of:
+                    index_of[successor] = lowlink[successor] = counter
+                    counter += 1
+                    stack.append(successor)
+                    on_stack.add(successor)
+                    work.append((successor, iter(graph[successor])))
+                    advanced = True
+                    break
+                if successor in on_stack:
+                    lowlink[node] = min(lowlink[node], index_of[successor])
+            if advanced:
+                continue
+
+            work.pop()
+            if lowlink[node] == index_of[node]:
+                component: List[str] = []
+                while True:
+                    member = stack.pop()
+                    on_stack.remove(member)
+                    component.append(member)
+                    if member == node:
+                        break
+                components.append(sorted(component, key=order.__getitem__))
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[node])
+
+    components.sort(key=lambda component: order[component[0]])
+    return components
+
+
+def _cycle_path(
+    component: Sequence[str], graph: Mapping[str, Sequence[str]]
+) -> List[str]:
+    """
+    Return one concrete reference cycle within a strongly connected component.
+
+    The cycle starts and ends with the component's first key (the one that
+    appears first in the file) and is found with a breadth-first search, so it
+    is also one of the shortest cycles through that key. This keeps the error
+    message small even when a large group of keys is tangled together.
+    """
+    members = set(component)
+    start = component[0]
+    parents: Dict[str, Optional[str]] = {start: None}
+    queue: "deque[str]" = deque([start])
+
+    while queue:
+        node = queue.popleft()
+        for successor in graph[node]:
+            if successor not in members:
+                continue
+            if successor == start and node != start:
+                chain: List[str] = []
+                current: Optional[str] = node
+                while current is not None:
+                    chain.append(current)
+                    current = parents[current]
+                chain.reverse()
+                return [*chain, start]
+            if successor not in parents:
+                parents[successor] = node
+                queue.append(successor)
+
+    # Every node of a strongly connected component can reach the start, so
+    # this is unreachable.
+    raise AssertionError("no cycle found in a strongly connected component")
+
+
+def _check_circular_references(values: Iterable[Tuple[str, Optional[str]]]) -> None:
+    """
+    Raise `CircularInterpolationError` if the file's keys reference each other
+    in a cycle.
+
+    The graph has an edge from a key to every other key defined in the file
+    that its *effective* definition references. The effective definition is
+    the last one for that key: that is the definition whose value is
+    delivered, and an earlier definition that was later replaced no longer
+    contributes to it.
+
+    Self edges are ignored. `A=${A}` is the supported idiom of falling back to
+    the environment, an earlier definition, the default, or an empty string,
+    because the key itself is not yet in the values collected from the file
+    when it is resolved. A cycle therefore means two or more keys whose final
+    values each depend on the other's; neither has a fallback, so whichever is
+    resolved first cannot see the other and silently becomes an empty string,
+    which is indistinguishable from a legitimately empty value.
+
+    A key that references a key defined later in the file, without any
+    reference back, is not a cycle: it keeps the documented behaviour of
+    falling back to the environment, the default, or the empty string.
+    """
+    effective: "OrderedDict[str, Optional[str]]" = OrderedDict()
+    for name, value in values:
+        effective[name] = value
+
+    graph: "OrderedDict[str, List[str]]" = OrderedDict((name, []) for name in effective)
+    for name, value in effective.items():
+        for referenced in _referenced_names(value):
+            # Only references to other keys defined in this file take part in
+            # the cycle; anything else, including the key itself, comes from
+            # the environment, an earlier definition, or the default.
+            if referenced in graph and referenced != name:
+                graph[name].append(referenced)
+    for name in graph:
+        # A value can reference the same key more than once; keep the graph
+        # proportional to the number of distinct references.
+        graph[name] = list(dict.fromkeys(graph[name]))
+
+    cycles = [
+        _cycle_path(component, graph)
+        for component in _strongly_connected_components(graph)
+        if len(component) > 1
+    ]
+    if cycles:
+        raise CircularInterpolationError(cycles)
+
+
 def resolve_variables(
     values: Iterable[Tuple[str, Optional[str]]],
     override: bool,
 ) -> Mapping[str, Optional[str]]:
+    values = list(values)
+    _check_circular_references(values)
+
     new_values: Dict[str, Optional[str]] = {}
 
     for name, value in values:

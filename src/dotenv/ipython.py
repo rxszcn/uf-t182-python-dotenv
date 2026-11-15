@@ -5,7 +5,7 @@ from IPython.core.magic_arguments import (
     parse_argstring,
 )  # type: ignore
 
-from .main import find_dotenv, load_dotenv
+from .main import CircularInterpolationError, find_dotenv, load_dotenv
 
 
 @magics_class
@@ -42,7 +42,10 @@ class IPythonDotEnv(Magics):
             return
 
         # Load the .env file
-        load_dotenv(dotenv_path, verbose=args.verbose, override=args.override)
+        try:
+            load_dotenv(dotenv_path, verbose=args.verbose, override=args.override)
+        except CircularInterpolationError as exc:
+            print(exc)
 
 
 def load_ipython_extension(ipython):
